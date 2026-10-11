@@ -6,3 +6,11 @@ __pycache__/
 .venv/
 venv/
 .DS_Store
+*.log
+.env
+.env.*
+config.json
+models/
+*.onnx
+*.onnx.data
+*.wav

@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 """Dictate GUI — PyQt6 tray app for voice dictation via Groq Whisper."""
-import fcntl
 import sys
 import threading
 import time
 
 import numpy as np
-from PyQt6.QtCore import Qt, QObject, QTimer, pyqtSignal
+from PyQt6.QtCore import Qt, QObject, QTimer, QLockFile, pyqtSignal
 from PyQt6.QtGui import QAction, QColor, QIcon, QPainter, QPixmap
 from PyQt6.QtWidgets import (
     QApplication, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox,
@@ -19,8 +18,37 @@ from pynput import keyboard
 import core
 
 
-def _make_listener(on_press, on_release):
+def _make_listener(on_press, on_release, target_keys=()):
     """Prefer evdev (works on Wayland+Xorg); fall back to pynput on failure."""
+    if sys.platform == "win32":
+        function_keys = {getattr(keyboard.Key, f"f{i}") for i in range(1, 13)}
+        captured_keys = {
+            key.value.vk: key for key in target_keys if key in function_keys
+        }
+
+        def event_filter(msg, data):
+            key = captured_keys.get(data.vkCode)
+            if key is not None:
+                if msg in (0x0100, 0x0104):
+                    on_press(key)
+                elif msg in (0x0101, 0x0105):
+                    on_release(key)
+                else:
+                    return True
+                # Dispatch the recording event ourselves, then prevent the
+                # same function key from triggering the foreground app.
+                l.suppress_event()
+            return True
+
+        l = keyboard.Listener(
+            on_press=on_press,
+            on_release=on_release,
+            win32_event_filter=event_filter,
+        )
+        l.daemon = True
+        l.start()
+        print("keyboard listener: Windows (capture hotkey)", file=sys.stderr)
+        return l
     try:
         import evdev_listener
         l = evdev_listener.Listener(on_press=on_press, on_release=on_release)
@@ -372,7 +400,8 @@ class MainWindow(QMainWindow):
         header.addWidget(title)
         header.addStretch()
         self.settings_btn = QPushButton("Settings")
-        self.settings_btn.clicked.connect(self.open_settings)
+        self.settings_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.settings_btn.clicked.connect(lambda: self.open_settings("button"))
         header.addWidget(self.settings_btn)
         v.addLayout(header)
 
@@ -389,9 +418,18 @@ class MainWindow(QMainWindow):
         self.last.setReadOnly(True)
         self.last.setMaximumHeight(110)
         self.last.setStyleSheet(
-            "QTextEdit { background: #fafafa; border: 1px solid #ddd; border-radius: 6px; padding: 6px; }"
+            "QTextEdit { background: #fafafa; color: #222; selection-background-color: #2563eb; selection-color: #fff; border: 1px solid #ddd; border-radius: 6px; padding: 6px; }"
         )
         v.addWidget(self.last)
+
+        self.copy_btn = QPushButton("Text kopieren")
+        self.copy_btn.setEnabled(False)
+        self.copy_btn.clicked.connect(self.copy_transcription)
+        v.addWidget(self.copy_btn)
+
+        hint = QLabel("Zum direkten Einfügen zuerst ins gewünschte Nachrichtenfeld klicken, dann F9 halten.")
+        hint.setWordWrap(True)
+        v.addWidget(hint)
 
         v.addStretch()
 
@@ -443,7 +481,7 @@ class MainWindow(QMainWindow):
             "  * OpenAI (cloud — platform.openai.com)\n"
             "  * Local (offline, German, CPU — one-time 640 MB download)",
         )
-        self.open_settings()
+        self.open_settings("first run")
 
     def update_info(self):
         mode_name = "Push-to-talk" if self.cfg["mode"] == "ptt" else "Toggle"
@@ -454,7 +492,8 @@ class MainWindow(QMainWindow):
             f"Model: {self.cfg['model']}{thr_str}"
         )
 
-    def open_settings(self):
+    def open_settings(self, source="button"):
+        core.log.info("settings opened: %s", source)
         dlg = SettingsDialog(self.cfg, self)
         if dlg.exec() == QDialog.DialogCode.Accepted:
             self.cfg.update(dlg.values())
@@ -486,7 +525,7 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
 
-        self.listener = _make_listener(on_press, on_release)
+        self.listener = _make_listener(on_press, on_release, self._target_keys)
 
     def restart_listener(self):
         if self.listener:
@@ -612,9 +651,28 @@ class MainWindow(QMainWindow):
 
     def on_transcribed(self, text):
         if text:
-            threading.Thread(target=core.type_text, args=(text,), daemon=True).start()
             self.last.setPlainText(text)
+            self.copy_btn.setEnabled(True)
+            # Typing spaces into a focused QPushButton activates it. Never
+            # inject dictated text into Dictate's own window or settings.
+            if QApplication.activeWindow() is not None:
+                core.log.info("text retained in Dictate: its own window has focus")
+                self.set_status("ready", "Text erkannt — zum Einfügen ins Nachrichtenfeld klicken")
+                return
+            threading.Thread(target=self._type_transcription, args=(text,), daemon=True).start()
         self.set_status("ready", "Ready")
+
+    def _type_transcription(self, text):
+        try:
+            core.type_text(text)
+            core.log.info("text insertion finished: %d chars", len(text))
+        except Exception:
+            core.log.exception("text insertion failed")
+            self.bridge.error.emit("Einfügen fehlgeschlagen — Text kopieren verwenden")
+
+    def copy_transcription(self):
+        QApplication.clipboard().setText(self.last.toPlainText())
+        self.set_status("ready", "Text kopiert — mit Ctrl+V einfügen")
 
     def on_error(self, msg):
         self.set_status("error", f"Error: {msg[:80]}")
@@ -645,7 +703,12 @@ class MainWindow(QMainWindow):
         self.activateWindow()
 
     def closeEvent(self, event):
-        QApplication.quit()
+        if self.tray is not None:
+            event.ignore()
+            self.hide()
+        else:
+            event.accept()
+            QApplication.quit()
 
 
 _LOCK_FD = None
@@ -655,14 +718,11 @@ def acquire_single_instance_lock():
     global _LOCK_FD
     core.CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     lock_path = core.CONFIG_DIR / "dictate.lock"
-    fd = open(lock_path, "w")
-    try:
-        fcntl.flock(fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError:
-        fd.close()
+    lock = QLockFile(str(lock_path))
+    if not lock.tryLock(0):
         core.notify("Dictate is already running", urgency="low")
         return False
-    _LOCK_FD = fd
+    _LOCK_FD = lock
     return True
 
 
