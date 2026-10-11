@@ -2,7 +2,9 @@
 
 **Sprache lokal in Text umwandeln und direkt in ein beliebiges Eingabefeld diktieren.**
 
-Windows-Version von [winidi/dictate](https://github.com/winidi/dictate), gepflegt von [abartiggut](https://github.com/abartiggut). Die ursprüngliche Dokumentation liegt in [README.upstream.md](README.upstream.md).
+Windows-Version von [winidi/dictate](https://github.com/winidi/dictate), gepflegt von [abartiggut](https://github.com/abartiggut).
+
+**Dieser Fork wird ausschliesslich für Windows gepflegt, getestet und unterstützt.** Für macOS findest du die Hinweise im [Originalrepo von winidi/dictate](https://github.com/winidi/dictate#readme). Mac-Anleitungen und Mac-Support werden in diesem Fork nicht angeboten. Auch die ursprüngliche Linux-Dokumentation findest du direkt im Originalrepo.
 
 Die deutsche Spracherkennung läuft mit Parakeet auf deiner CPU. Nach dem einmaligen Download ist sie offline nutzbar: keine GPU, kein API-Key und kein Audio-Upload. Ein Chatdienst wie Codex verarbeitet den anschliessend gesendeten Text weiterhin über seinen eigenen Dienst.
 
